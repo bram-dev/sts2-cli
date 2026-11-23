@@ -24,7 +24,7 @@ import queue
 import threading
 from game_log import GameLogger
 
-VALID_CHARACTERS = ["Ironclad", "Silent", "Defect", "Regent", "Necrobinder"]
+VALID_CHARACTERS = ["Ironclad", "Silent", "Defect", "Regent", "Necrobinder", "Professor"]
 
 def _find_dotnet():
     for p in [os.path.expanduser("~/.dotnet-arm64/dotnet"),

@@ -100,6 +100,7 @@ internal class LocLookup
         var baseDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..");
         Load(Path.Combine(baseDir, "localization_eng"), _eng);
         Load(Path.Combine(baseDir, "localization_zhs"), _zhs);
+        foreach (var extra in (Environment.GetEnvironmentVariable("STS2_MOD_LOC") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)) Load(extra, _eng);
     }
 
     private static void Load(string dir, Dictionary<string, Dictionary<string, string>> target)
@@ -111,7 +112,8 @@ internal class LocLookup
             {
                 var name = Path.GetFileNameWithoutExtension(file);
                 var data = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(file));
-                if (data != null) target[name] = data;
+                if (data == null) continue;
+                if (target.TryGetValue(name, out var have)) { foreach (var kv in data) have[kv.Key] = kv.Value; } else target[name] = data;
             }
             catch { }
         }
@@ -238,6 +240,8 @@ public class RunSimulator
             _loc.Lang = lang;
             EnsureModelDbInitialized();
 
+            ResetForNewRun();
+
             var player = CreatePlayer(character);
             if (player == null)
                 return Error($"Unknown character: {character}");
@@ -269,9 +273,13 @@ public class RunSimulator
             RunManager.Instance.Launch();
             Log("Run launched");
 
-            // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            // Register event handlers for combat turn transitions (eenmalig: CombatManager is een singleton)
+            if (!_combatHandlersRegistered)
+            {
+                _combatHandlersRegistered = true;
+                CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+                CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            }
 
             // Finalize starting relics
             RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
@@ -282,7 +290,7 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            UseCardSelector();
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -292,6 +300,115 @@ public class RunSimulator
         {
             return ErrorWithTrace("StartRun failed", ex);
         }
+    }
+
+    private bool _combatHandlersRegistered;
+
+    private static List<string>? PileIds(MegaCrit.Sts2.Core.Entities.Cards.CardPile? pile) =>
+        pile?.Cards?.Select(c => c.Id.Entry + (c.IsUpgraded ? "+" : "")).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+    /// <summary>De selftest van de mod (prof_selftest) headless: SelfTestRunner.RunAsync, elk check in een eigen testgevecht.</summary>
+    public Dictionary<string, object?> ModSelfTest(string? filter, int timeoutSec)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var asm = HeadlessModLoader.Assemblies.FirstOrDefault(a => a.GetName().Name == "Professor");
+            if (asm == null) return Error("selftest: Professor.dll is niet geladen");
+            const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+            var runner = asm.GetType("Professor.ProfessorCode.Debug.SelfTest.SelfTestRunner")!;
+            var sel = new object?[] { filter, null };
+            var checks = runner.GetMethod("Select", F)!.Invoke(null, sel);
+            if (checks == null) return Error("selftest: " + sel[1]);
+            var task = (Task<int>)runner.GetMethod("RunAsync", F)!.Invoke(null, new object?[] { _runState.Players[0], checks, true })!;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (!task.IsCompleted && sw.Elapsed.TotalSeconds < timeoutSec) { _syncCtx.Pump(); Thread.Sleep(1); }
+            if (!task.IsCompleted) return new Dictionary<string, object?> { ["type"] = "selftest", ["done"] = false, ["seconds"] = (int)sw.Elapsed.TotalSeconds };
+            if (task.IsFaulted) return ErrorWithTrace("selftest", task.Exception!.InnerException ?? task.Exception);
+            return new Dictionary<string, object?> { ["type"] = "selftest", ["done"] = true, ["fails"] = task.Result, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds, 1) };
+        }
+        catch (Exception ex) { return ErrorWithTrace("selftest", ex.InnerException ?? ex); }
+    }
+
+    // ─── Bot van de mod (CombatPlanner / DeckStrategy) als adviseur: geeft de actie terug, voert hem niet uit ───
+    private readonly HashSet<CardModel> _botTried = new();
+    private int _botRound = -1;
+    private object? _botCombat;
+
+    private Dictionary<string, object?> DoBotAction(Player player, Dictionary<string, object?>? args)
+    {
+        var asm = HeadlessModLoader.Assemblies.FirstOrDefault(a => a.GetName().Name == "Professor");
+        if (asm == null) return Error("bot_action: Professor.dll is niet geladen");
+        const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        string ns = "Professor.ProfessorCode.Debug.";
+        var profile = asm.GetType(ns + "StrategyProfiles")!.GetMethod("Get", F)!.Invoke(null, new object?[] { args != null && args.TryGetValue("profile", out var pn) ? pn as string : null });
+        if (_pendingCardReward != null)
+        {
+            var options = _pendingCardReward.Cards.Select(c => (CardModel?)c).ToList();
+            var r = (System.Runtime.CompilerServices.ITuple)asm.GetType(ns + "DeckStrategy")!.GetMethod("PickReward", F)!.Invoke(null, new object?[] { options, profile })!;
+            return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = "select_card_reward",
+                ["args"] = new Dictionary<string, object?> { ["card_index"] = (int)r[0]! }, ["why"] = r[1] as string };
+        }
+        if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+        {
+            // Zoals AutoPilot.SelectorPatch: eerst de MixPrefer-kaarten van het profiel; anders kiest de game-bot willekeurig.
+            var list = _cardSelector.PendingOptions;
+            var prefer = (string[])profile!.GetType().GetProperty("MixPrefer")!.GetValue(profile)!;
+            var preferred = ((System.Collections.IEnumerable)asm.GetType(ns + "StrategyRules")!.GetMethod("Preferred", F)!.Invoke(null, new object?[] { list, prefer })!).Cast<CardModel>().ToList();
+            int n = Math.Min(_cardSelector.PendingMaxSelect, list.Count);
+            if (n < _cardSelector.PendingMinSelect) n = Math.Min(_cardSelector.PendingMinSelect, list.Count);
+            var picked = preferred.Concat(list.Except(preferred)).Take(Math.Max(n, 0)).ToList();
+            return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = picked.Count > 0 ? "select_cards" : "skip_select",
+                ["args"] = new Dictionary<string, object?> { ["indices"] = string.Join(",", picked.Select(c => list.IndexOf(c))) },
+                ["why"] = preferred.Count > 0 ? "mix_prefer" : "random_in_game" };
+        }
+        if (!CombatManager.Instance.IsInProgress || !IsPlayPhase() || HasPendingSelection)
+            return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = null, ["why"] = "geen gevechts- of rewardbeslissing" };
+        var cs = CombatManager.Instance.DebugOnlyGetState();
+        if (cs?.RoundNumber != _botRound || !ReferenceEquals(cs, _botCombat)) { _botTried.Clear(); _botRound = cs?.RoundNumber ?? -1; _botCombat = cs; }
+        var pick = (System.Runtime.CompilerServices.ITuple)asm.GetType(ns + "CombatPlanner")!.GetMethod("Pick", F)!.Invoke(null, new object?[] { player, profile, _botTried })!;
+        var card = pick[0] as CardModel;
+        if (card == null) return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = "end_turn", ["args"] = new Dictionary<string, object?>(), ["why"] = "" };
+        var target = pick[1] as MegaCrit.Sts2.Core.Entities.Creatures.Creature
+            ?? asm.GetType(ns + "StrategyRules")!.GetMethod("TargetFor", F)!.Invoke(null, new object?[] { card, player, profile }) as MegaCrit.Sts2.Core.Entities.Creatures.Creature;
+        _botTried.Add(card);
+        var a = new Dictionary<string, object?> { ["card_index"] = player.PlayerCombatState!.Hand.Cards.ToList().IndexOf(card) };
+        var alive = cs!.Enemies.Where(e => e != null && e.IsAlive).ToList();
+        if (target != null && alive.IndexOf(target) >= 0) a["target_index"] = alive.IndexOf(target);
+        return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = "play_card", ["args"] = a, ["why"] = pick[2] as string, ["card"] = card.Id.Entry };
+    }
+    private IDisposable? _selectorScope;
+    private void UseCardSelector()
+    {
+        try { _selectorScope?.Dispose(); } catch { }
+        _selectorScope = MegaCrit.Sts2.Core.CardSelection.CardSelectorStack.SetTestSelector(_cardSelector);
+    }
+
+    /// <summary>Ruimt een vorige run in dit proces op, zodat start_run opnieuw kan (scheelt het opstarten per run).</summary>
+    private void ResetForNewRun()
+    {
+        if (!RunManager.Instance.IsInProgress && _runState == null) return;
+        try { RunManager.Instance.CleanUp(graceful: false); }
+        catch (Exception ex) { Log($"CleanUp: {ex.GetType().Name}: {ex.Message}"); }
+        if (RunManager.Instance.IsInProgress)
+        {
+            // CleanUp brak af voor het einde: State hard leegmaken, anders weigert SetUpTest.
+            try { typeof(RunManager).GetProperty("State")!.GetSetMethod(true)!.Invoke(RunManager.Instance, new object?[] { null }); } catch { }
+        }
+        try { _selectorScope?.Dispose(); } catch { }
+        _selectorScope = null;
+        _runState = null;
+        _pendingEventOptionTask = null;
+        _pendingRewards = null;
+        _pendingCardReward = null;
+        _rewardsProcessed = false;
+        _pendingBundles = null;
+        _pendingBundleTcs = null;
+        _combatTurnTimedOut = false;
+        _goldBeforeCombat = 0;
+        _lastKnownHp = 0;
+        _turnStarted.Reset();
+        _combatEnded.Reset();
     }
 
     // ─── Test/Debug commands ───
@@ -526,7 +643,7 @@ public class RunSimulator
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
-            CardSelectCmd.UseSelector(_cardSelector);
+            UseCardSelector();
             LocPatches._bundleSimRef = this;
 
             var savedRoom = _runState.CurrentRoom;
@@ -888,6 +1005,8 @@ public class RunSimulator
             {
                 case "select_map_node":
                     return DoMapSelect(player, args);
+                case "bot_action":
+                    return DoBotAction(player, args);
                 case "play_card":
                     return DoPlayCard(player, args);
                 case "end_turn":
@@ -1022,6 +1141,7 @@ public class RunSimulator
         Log($"Playing card {card.GetType().Name} (index {cardIndex}) targeting {(target != null ? target.Monster?.GetType().Name ?? "creature" : "none")}");
 
         var handCountBefore = hand.Count;
+        int playsBefore = 0; try { playsBefore = CombatManager.Instance.History.CardPlaysStarted.Count(); } catch { }
 
         var playAction = new PlayCardAction(card, target);
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
@@ -1029,7 +1149,9 @@ public class RunSimulator
 
         // Check if card play had no effect (hand unchanged, same card still at same index)
         var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        // Een kaart die volgens de regels terugkomt in de hand (bv. Pipette) is wél gespeeld: kijk naar de gevechtshistorie.
+        int playsAfter = playsBefore; try { playsAfter = CombatManager.Instance.History.CardPlaysStarted.Count(); } catch { }
+        if (playsAfter == playsBefore && handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
         {
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
@@ -1193,8 +1315,8 @@ public class RunSimulator
             return Error("buy_card requires 'card_index'");
 
         var idx = Convert.ToInt32(args["card_index"]);
-        var allEntries = merchantRoom.GetLocalInventory().CharacterCardEntries
-            .Concat(merchantRoom.GetLocalInventory().ColorlessCardEntries).ToList();
+        var allEntries = RunManager.Instance.MerchantSynchronizer.GetLocalInventory().CharacterCardEntries
+            .Concat(RunManager.Instance.MerchantSynchronizer.GetLocalInventory().ColorlessCardEntries).ToList();
         if (idx < 0 || idx >= allEntries.Count)
             return Error($"Invalid card index {idx}");
 
@@ -1204,7 +1326,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            entry.OnTryPurchaseUnsynchronized(RunManager.Instance.MerchantSynchronizer.GetLocalInventory(), false).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
@@ -1221,7 +1343,7 @@ public class RunSimulator
             return Error("buy_relic requires 'relic_index'");
 
         var idx = Convert.ToInt32(args["relic_index"]);
-        var entries = merchantRoom.GetLocalInventory().RelicEntries;
+        var entries = RunManager.Instance.MerchantSynchronizer.GetLocalInventory().RelicEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid relic index {idx}");
 
         var entry = entries[idx];
@@ -1234,8 +1356,8 @@ public class RunSimulator
             // Adroit, #80). Run the purchase on a background task and yield as soon as a
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
-            var inv = merchantRoom.GetLocalInventory();
-            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            var inv = RunManager.Instance.MerchantSynchronizer.GetLocalInventory();
+            var task = Task.Run(() => entry.OnTryPurchaseUnsynchronized(inv, false));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1266,7 +1388,7 @@ public class RunSimulator
             return Error("buy_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        var entries = merchantRoom.GetLocalInventory().PotionEntries;
+        var entries = RunManager.Instance.MerchantSynchronizer.GetLocalInventory().PotionEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid potion index {idx}");
 
         var entry = entries[idx];
@@ -1275,7 +1397,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            entry.OnTryPurchaseUnsynchronized(RunManager.Instance.MerchantSynchronizer.GetLocalInventory(), false).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1293,14 +1415,14 @@ public class RunSimulator
         if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
             return Error("Not in a shop");
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removal = RunManager.Instance.MerchantSynchronizer.GetLocalInventory().CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
 
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+            var task = Task.Run(() => removal.OnTryPurchaseUnsynchronized(RunManager.Instance.MerchantSynchronizer.GetLocalInventory(), false));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1583,7 +1705,7 @@ public class RunSimulator
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
         Log("Leaving room");
-        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
+        try { RunManager.Instance.ProceedFromTerminalRewardsScreen(); }
         catch { }
         _syncCtx.Pump();
         WaitForActionExecutor();
@@ -1657,7 +1779,7 @@ public class RunSimulator
             }
         }
 
-        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+        RunManager.Instance.ProceedFromTerminalRewardsScreen();
         WaitForActionExecutor();
         return DetectDecisionPoint();
     }
@@ -2160,7 +2282,9 @@ public class RunSimulator
                 // Enemy powers
                 var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
                 {
-                    ["name"] = _loc.Power(pw.Id.Entry),
+                    ["id"] = pw.Id.Entry,
+                    ["id"] = pw.Id.Entry,
+            ["name"] = _loc.Power(pw.Id.Entry),
                     ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
                     ["amount"] = pw.Amount,
                 }).ToList();
@@ -2168,6 +2292,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = e.Monster?.Id.Entry,
                     ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
                     ["hp"] = e.CurrentHp,
                     ["max_hp"] = e.MaxHp,
@@ -2181,6 +2306,7 @@ public class RunSimulator
         // Player powers/buffs
         var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
         {
+            ["id"] = pw.Id.Entry,
             ["name"] = _loc.Power(pw.Id.Entry),
             ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
             ["amount"] = pw.Amount,
@@ -2200,6 +2326,19 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            // Wat een speler ook kan inzien: inhoud van de stapels ZONDER volgorde (gesorteerd op id), en de pets.
+            ["draw_pile"] = PileIds(pcs?.DrawPile),
+            ["discard_pile"] = PileIds(pcs?.DiscardPile),
+            ["exhaust_pile"] = PileIds(pcs?.ExhaustPile),
+            ["pets"] = pcs?.Pets?.Select(p => new Dictionary<string, object?>
+            {
+                ["id"] = p.Monster?.Id.Entry,
+                ["hp"] = p.CurrentHp,
+                ["max_hp"] = p.MaxHp,
+                ["block"] = p.Block,
+                ["alive"] = p.IsAlive,
+                ["powers"] = p.Powers?.Select(pw => new Dictionary<string, object?> { ["id"] = pw.Id.Entry, ["amount"] = pw.Amount }).ToList(),
+            }).ToList(),
         };
 
         // Character-specific mechanics
@@ -2372,7 +2511,7 @@ public class RunSimulator
     {
         try
         {
-            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            RunManager.Instance.ProceedFromTerminalRewardsScreen();
             _syncCtx.Pump();
         }
         catch { }
@@ -2395,7 +2534,7 @@ public class RunSimulator
             Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
             try
             {
-                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+                RunManager.Instance.ProceedFromTerminalRewardsScreen();
                 _syncCtx.Pump();
             }
             catch { }
@@ -2587,7 +2726,7 @@ public class RunSimulator
 
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
-        var inv = merchantRoom.GetLocalInventory();
+        var inv = RunManager.Instance.MerchantSynchronizer.GetLocalInventory();
         if (inv == null) { ForceToMap(); return MapSelectState(); }
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
@@ -2652,7 +2791,7 @@ public class RunSimulator
             ["is_stocked"] = e.IsStocked,
         }).ToList();
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removal = RunManager.Instance.MerchantSynchronizer.GetLocalInventory().CardRemovalEntry;
 
         return new Dictionary<string, object?>
         {
@@ -2691,7 +2830,7 @@ public class RunSimulator
                 // results, then grant them ourselves after the pick resolves (granting inside the
                 // event — mid action-execution — risks re-entrancy).
                 List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>? awarded = null;
-                Action<List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>> capture = r => awarded = r;
+                Action<List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>, bool> capture = (r, _) => awarded = r;
                 relicSync.RelicsAwarded += capture;
                 try
                 {
@@ -2986,6 +3125,7 @@ public class RunSimulator
             ["floor"] = _runState.ActFloor,
             ["room_type"] = _runState.CurrentRoom?.RoomType.ToString(),
         };
+        try { if (_runState.CurrentRoom is CombatRoom cr0) ctx["encounter"] = cr0.Encounter?.Id.Entry; } catch { }
 
         // Boss encounter info — use BossEncounter?.Id?.Entry
         try
@@ -3019,6 +3159,7 @@ public class RunSimulator
         // for unmodded runs. TestMode skips filesystem/workshop mod loading.
         MegaCrit.Sts2.Core.Modding.ModManager.Initialize(
             new MegaCrit.Sts2.Core.Modding.ModManagerFileIo(), null, null).GetAwaiter().GetResult();
+        HeadlessModLoader.LoadAssemblies();
         MegaCrit.Sts2.Core.Modding.AssemblyInfo.Init();
 
         // Install inline sync context on main thread
@@ -3062,8 +3203,16 @@ public class RunSimulator
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
+        HeadlessModLoader.InitMods();
 
-        var subtypes = MegaCrit.Sts2.Core.Models.AbstractModelSubtypes.All;
+        if (HeadlessModLoader.Enabled)
+        {
+            // Mods (BaseLib) hangen hun late initialisatie aan ModelDb.Init/InitIds (o.a. waarden voor [CustomEnum]-velden:
+            // eigen keywords, piles, targettypes). sts2-cli slaat die methodes over; met mods roepen we ze echt aan.
+            try { ModelDb.Init(); Console.Error.WriteLine("[MODS] ModelDb.Init: ok"); }
+            catch (Exception ex) { var e = ex.InnerException ?? ex; Console.Error.WriteLine($"[MODS] ModelDb.Init: FOUT {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
+        }
+        IReadOnlyList<Type> subtypes = HeadlessModLoader.Enabled ? ModelDb.AllAbstractModelSubtypes : MegaCrit.Sts2.Core.Models.AbstractModelSubtypes.All;
         int registered = 0, failed = 0;
         for (int i = 0; i < subtypes.Count; i++)
         {
@@ -3081,6 +3230,7 @@ public class RunSimulator
             }
         }
         Console.Error.WriteLine($"[INFO] ModelDb: {registered} registered, {failed} failed out of {subtypes.Count}");
+
 
         // Progress now resolves character models, so register ModelDb first.
         SaveManager.Instance.InitProgressData();
@@ -3107,6 +3257,11 @@ public class RunSimulator
         {
             Console.Error.WriteLine($"[WARN] ModelIdSerializationCache.Init: {ex.Message}");
         }
+        if (HeadlessModLoader.Enabled)
+        {
+            try { ModelDb.InitIds(); Console.Error.WriteLine("[MODS] ModelDb.InitIds: ok"); }
+            catch (Exception ex) { var e = ex.InnerException ?? ex; Console.Error.WriteLine($"[MODS] ModelDb.InitIds: FOUT {e.GetType().Name}: {e.Message}\n{e.StackTrace}"); }
+        }
     }
 
     private Player? CreatePlayer(string characterName)
@@ -3118,8 +3273,23 @@ public class RunSimulator
             "defect" => Player.CreateForNewRun<Defect>(UnlockState.all, 1uL),
             "regent" => Player.CreateForNewRun<Regent>(UnlockState.all, 1uL),
             "necrobinder" => Player.CreateForNewRun<Necrobinder>(UnlockState.all, 1uL),
-            _ => null
+            _ => CreateModPlayer(characterName)
         };
+    }
+
+    private static Player? CreateModPlayer(string characterName)
+    {
+        var ch = ModelDb.AllCharacters.FirstOrDefault(c => c.GetType().Name.Equals(characterName, StringComparison.OrdinalIgnoreCase));
+        if (ch == null)
+        {
+            foreach (var asm in HeadlessModLoader.Assemblies)
+            {
+                Type[] ts; try { ts = asm.GetTypes(); } catch (System.Reflection.ReflectionTypeLoadException ex) { ts = ex.Types.Where(t => t != null).ToArray()!; }
+                var t = ts.FirstOrDefault(x => typeof(CharacterModel).IsAssignableFrom(x) && !x.IsAbstract && x.Name.Equals(characterName, StringComparison.OrdinalIgnoreCase));
+                if (t != null) { ch = (CharacterModel)typeof(ModelDb).GetMethod("Character")!.MakeGenericMethod(t).Invoke(null, null)!; break; }
+            }
+        }
+        return ch == null ? null : Player.CreateForNewRun(ch, UnlockState.all, 1uL);
     }
 
     private static void PatchCmdWait()
@@ -3435,7 +3605,16 @@ public class RunSimulator
                         var data = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(
                             File.ReadAllText(file));
                         if (data != null)
+                        {
+                            foreach (var extra in (Environment.GetEnvironmentVariable("STS2_MOD_LOC") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+                            {
+                                var ef = Path.Combine(extra, name + ".json");
+                                if (!File.Exists(ef)) continue;
+                                var ed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(ef));
+                                if (ed != null) foreach (var kv in ed) data[kv.Key] = kv.Value;
+                            }
                             tables[name] = new LocTable(name, data);
+                        }
                     }
                     catch { }
                 }

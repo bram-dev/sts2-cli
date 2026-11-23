@@ -110,6 +110,10 @@ class Program
 
     static Dictionary<string, object?>? HandleCommand(RunSimulator sim, JsonElement cmd)
     {
+        // Eerlijke modus (STS2_FAIR=1, voor ML): geen commando's die een mens niet heeft (staat zetten, trekvolgorde, saves laden).
+        if (Environment.GetEnvironmentVariable("STS2_FAIR") == "1" && cmd.TryGetProperty("cmd", out var fairCmd) &&
+            fairCmd.GetString() is "set_player" or "enter_room" or "set_draw_order" or "load_save" or "write_continue_save" or "selftest")
+            return new Dictionary<string, object?> { ["type"] = "error", ["message"] = "geblokkeerd in eerlijke modus (STS2_FAIR=1)" };
         var cmdType = cmd.GetProperty("cmd").GetString() ?? "";
         switch (cmdType)
         {
@@ -191,6 +195,10 @@ class Program
                 var outputPath = cmd.TryGetProperty("path", out var op) ? op.GetString() : null;
                 return sim.SaveCheckpoint(outputPath);
             }
+
+            case "selftest":
+                return sim.ModSelfTest(cmd.TryGetProperty("filter", out var stf) ? stf.GetString() : null,
+                    cmd.TryGetProperty("timeout", out var stt) ? stt.GetInt32() : 600);
 
             case "quit":
             {
