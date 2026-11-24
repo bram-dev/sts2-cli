@@ -41,12 +41,24 @@ internal class InlineSynchronizationContext : SynchronizationContext
 {
     private readonly Queue<(SendOrPostCallback, object?)> _queue = new();
     private bool _executing;
+    private readonly object _lock = new();
+
+    // Posts can arrive from thread-pool continuations while the main thread pumps: take under a lock,
+    // otherwise two drains race and Dequeue throws "Queue empty" (seen under CPU load).
+    private bool TryTake(out (SendOrPostCallback, object?) item)
+    {
+        lock (_lock)
+        {
+            if (_queue.Count > 0) { item = _queue.Dequeue(); return true; }
+            item = default; return false;
+        }
+    }
 
     public override void Post(SendOrPostCallback d, object? state)
     {
         if (_executing)
         {
-            _queue.Enqueue((d, state));
+            lock (_lock) _queue.Enqueue((d, state));
             return;
         }
         // removed debug log
@@ -57,9 +69,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
         {
             d(state);
             // Drain any callbacks that were queued during execution
-            while (_queue.Count > 0)
+            while (TryTake(out var item))
             {
-                var (cb, st) = _queue.Dequeue();
+                var (cb, st) = item;
                 cb(st);
             }
         }
@@ -77,9 +89,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
     public void Pump()
     {
         // Drain any remaining queued callbacks
-        while (_queue.Count > 0)
+        while (TryTake(out var item))
         {
-            var (cb, st) = _queue.Dequeue();
+            var (cb, st) = item;
             _executing = true;
             try { cb(st); }
             finally { _executing = false; }
