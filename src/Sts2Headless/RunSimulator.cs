@@ -388,6 +388,7 @@ public class RunSimulator
     private void ResetForNewRun()
     {
         if (!RunManager.Instance.IsInProgress && _runState == null) return;
+        try { _cardSelector.Abandon(); _syncCtx.Pump(); } catch (Exception ex) { Log($"Abandon selection: {ex.GetType().Name}: {ex.Message}"); }
         try { RunManager.Instance.CleanUp(graceful: false); }
         catch (Exception ex) { Log($"CleanUp: {ex.GetType().Name}: {ex.Message}"); }
         if (RunManager.Instance.IsInProgress)
@@ -454,7 +455,8 @@ public class RunSimulator
                         var id = rEl.GetString();
                         if (id == null) continue;
                         var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model.ToMutable());
+                        // Obtain (not a bare list.Add): sets the owner and runs the pickup hooks, like in a real run.
+                        if (model != null) RelicCmd.Obtain(model.ToMutable(), player).GetAwaiter().GetResult();
                     }
                 }
             }
@@ -3489,6 +3491,17 @@ public class RunSimulator
         public void CancelPending()
         {
             ResolvePending(Array.Empty<CardModel>());
+        }
+
+        /// <summary>Drop a pending selection without resuming the card effect (the run it belonged to is gone).</summary>
+        public void Abandon()
+        {
+            // Cancel (not just forget): the action executor is awaiting this choice and would block the next run's actions.
+            var tcs = _pendingTcs;
+            PendingOptions = null;
+            _pendingTcs = null;
+            PendingRewardCards = null;
+            tcs?.TrySetCanceled();
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
