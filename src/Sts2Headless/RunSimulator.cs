@@ -354,6 +354,31 @@ public class RunSimulator
         const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
         string ns = "Professor.ProfessorCode.Debug.";
         var profile = asm.GetType(ns + "StrategyProfiles")!.GetMethod("Get", F)!.Invoke(null, new object?[] { args != null && args.TryGetValue("profile", out var pn) ? pn as string : null });
+        // Route en rust volgens RunStrategy van de game-bot (de aanroeper zegt welke beslissing er ligt).
+        var dec = args != null && args.TryGetValue("decision", out var dn) ? dn?.ToString() : null;
+        if (dec == "map_select" || dec == "rest_site")
+        {
+            var map = _runState?.Map; if (map == null) return Error("bot_action: geen kaart");
+            var cur = (_runState!.CurrentMapCoord.HasValue ? map.GetPoint(_runState.CurrentMapCoord.Value) : null) ?? map.StartingMapPoint;
+            var kids = cur?.Children?.ToList() ?? new();
+            double hp = player.Creature.CurrentHp / (double)Math.Max(1, player.Creature.MaxHp);
+            Func<string, double> tune = k => (double)asm.GetType(ns + "Tuning")!.GetMethod("Get", F)!.Invoke(null, new object?[] { k })!;
+            if (dec == "map_select")
+            {
+                if (kids.Count == 0) return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = null, ["why"] = "geen routekeuze" };
+                var score = asm.GetType(ns + "RunStrategy")!.GetMethod("PathScore", F)!;
+                var scored = kids.Select(c => (c, s: (double)score.Invoke(null, new object?[] { c, hp, new Dictionary<(MapPoint, int), double>() })!)).OrderByDescending(x => x.s).ToList();
+                return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = "select_map_node",
+                    ["args"] = new Dictionary<string, object?> { ["col"] = (int)scored[0].c.coord.col, ["row"] = (int)scored[0].c.coord.row },
+                    ["why"] = string.Join(", ", scored.Select(x => $"{x.c.PointType} {x.s:F1}")) };
+            }
+            bool bossNext = kids.Any(c => c.PointType == MapPointType.Boss);
+            double pct = hp * 100;
+            bool heal = pct < tune(bossNext ? "heal_boss_pct" : "heal_pct");
+            bool Danger(MapPoint p, int depth) => depth > 0 && p.Children.Any(c => c.PointType is MapPointType.Elite or MapPointType.Boss || Danger(c, depth - 1));
+            if (tune("rest_v2") > 0 && cur != null && Danger(cur, 2)) heal = pct < tune("rest_ahead_pct");
+            return new Dictionary<string, object?> { ["type"] = "bot_action", ["action"] = "rest", ["heal"] = heal, ["why"] = $"HP {pct:F0}%{(bossNext ? ", boss next" : "")}" };
+        }
         if (_pendingCardReward != null)
         {
             var options = _pendingCardReward.Cards.Select(c => (CardModel?)c).ToList();
